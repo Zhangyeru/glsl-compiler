@@ -125,6 +125,28 @@ class HIREmitter {
     return llvm::Type::getInt32Ty(context_);
   }
 
+  llvm::Type *buffer_element_type(sema::TypeKind type) const {
+    if (type == sema::TypeKind::Vec4) {
+      return lower_type(sema::TypeKind::Vec4);
+    }
+    if (type == sema::TypeKind::Uint || type == sema::TypeKind::Int) {
+      return lower_type(sema::TypeKind::Int);
+    }
+    return lower_type(sema::TypeKind::Float);
+  }
+
+  sema::TypeKind normalize_buffer_element_kind(sema::TypeKind type) const {
+    if (type == sema::TypeKind::Vec4 || type == sema::TypeKind::Uint ||
+        type == sema::TypeKind::Int) {
+      return type;
+    }
+    return sema::TypeKind::Float;
+  }
+
+  llvm::Value *buffer_base_ptr(const std::string &) {
+    return state().data;
+  }
+
   llvm::Constant *default_value_for_type(sema::TypeKind type) const {
     llvm::Type *llvm_type = lower_type(type);
     if (llvm_type->isVoidTy()) {
@@ -402,8 +424,14 @@ class HIREmitter {
       case sema::TypeKind::Float:
         return llvm::ConstantFP::get(builder_.getFloatTy(), llvm::APFloat(static_cast<float>(std::stod(literal.value))));
       case sema::TypeKind::Int:
-      case sema::TypeKind::Uint:
-        return llvm::ConstantInt::get(builder_.getInt32Ty(), static_cast<uint64_t>(std::stoll(literal.value)), false);
+      case sema::TypeKind::Uint: {
+        std::string value = literal.value;
+        if (!value.empty() && (value.back() == 'u' || value.back() == 'U')) {
+          value.pop_back();
+        }
+        return llvm::ConstantInt::get(builder_.getInt32Ty(),
+                                      static_cast<uint64_t>(std::stoll(value)), false);
+      }
       case sema::TypeKind::Bool: {
         const bool truthy = literal.value == "true" || literal.value == "1";
         return llvm::ConstantInt::get(builder_.getInt1Ty(), truthy ? 1 : 0, false);
@@ -452,7 +480,25 @@ class HIREmitter {
       if (binary.op == "/") {
         return builder_.CreateFDiv(lhs, rhs, "fdiv.tmp");
       }
+      if (binary.op == "==") {
+        return builder_.CreateFCmpOEQ(lhs, rhs, "feq.tmp");
+      }
+      if (binary.op == "<") {
+        return builder_.CreateFCmpOLT(lhs, rhs, "flt.tmp");
+      }
     } else {
+      if (binary.op == "&") {
+        return builder_.CreateAnd(lhs, rhs, "and.tmp");
+      }
+      if (binary.op == "==") {
+        return builder_.CreateICmpEQ(lhs, rhs, "eq.tmp");
+      }
+      if (binary.op == "<") {
+        if (binary.lhs != nullptr && binary.lhs->type == sema::TypeKind::Uint) {
+          return builder_.CreateICmpULT(lhs, rhs, "ult.tmp");
+        }
+        return builder_.CreateICmpSLT(lhs, rhs, "slt.tmp");
+      }
       if (binary.op == "+") {
         return builder_.CreateAdd(lhs, rhs, "add.tmp");
       }
@@ -508,11 +554,13 @@ class HIREmitter {
       }
 
       llvm::Value *idx64 = builder_.CreateSExt(index, builder_.getInt64Ty());
-      llvm::Value *ptr =
-          builder_.CreateGEP(builder_.getFloatTy(), state().data, idx64, lhs_buffer->buffer_name + ".ptr");
+      const sema::TypeKind elem_kind = normalize_buffer_element_kind(lhs_buffer->type);
+      llvm::Type *elem_type = buffer_element_type(elem_kind);
+      llvm::Value *ptr = builder_.CreateGEP(elem_type, buffer_base_ptr(lhs_buffer->buffer_name), idx64,
+                                            lhs_buffer->buffer_name + ".ptr");
 
       llvm::Value *rhs = emit_expr(*binary.rhs);
-      rhs = cast_value(rhs, binary.rhs->type, sema::TypeKind::Float);
+      rhs = cast_value(rhs, binary.rhs->type, elem_kind);
       if (rhs == nullptr) {
         return nullptr;
       }
@@ -527,6 +575,10 @@ class HIREmitter {
   llvm::Value *emit_call(const hir::Call &call) {
     if (call.callee.rfind("__ctor.vec", 0) == 0) {
       return emit_vector_constructor(call);
+    }
+
+    if (call.callee == "barrier") {
+      return nullptr;
     }
 
     const auto fn_found = function_map_.find(call.callee);
@@ -598,24 +650,33 @@ class HIREmitter {
   }
 
   llvm::Value *emit_builtin_load(const hir::BuiltinLoad &load) {
-    if (load.builtin_name != "gl_GlobalInvocationID") {
+    if (load.builtin_name != "gl_GlobalInvocationID" &&
+        load.builtin_name != "gl_LocalInvocationID") {
       add_error("unsupported builtin load: " + load.builtin_name);
       return nullptr;
     }
 
-    if (load.component.empty() || load.component == "x") {
+    llvm::Value *component_value = state().global_id_x;
+    if (load.component == "y") {
+      component_value = state().global_id_x;
+    } else if (load.component == "z") {
+      component_value = builder_.getInt32(0);
+    }
+
+    if (load.component.empty() || load.component == "x" || load.component == "y" ||
+        load.component == "z") {
       if (load.type == sema::TypeKind::Float) {
-        return builder_.CreateUIToFP(state().global_id_x, builder_.getFloatTy(), "gid.x.f");
+        return builder_.CreateUIToFP(component_value, builder_.getFloatTy(), "gid.comp.f");
       }
       if (load.type == sema::TypeKind::Int || load.type == sema::TypeKind::Uint) {
-        return state().global_id_x;
+        return component_value;
       }
       if (load.type == sema::TypeKind::Bool) {
-        return builder_.CreateICmpNE(state().global_id_x, builder_.getInt32(0), "gid.x.b");
+        return builder_.CreateICmpNE(component_value, builder_.getInt32(0), "gid.comp.b");
       }
       if (load.type == sema::TypeKind::Vec2 || load.type == sema::TypeKind::Vec3 ||
           load.type == sema::TypeKind::Vec4) {
-        llvm::Value *x = builder_.CreateUIToFP(state().global_id_x, builder_.getFloatTy(), "gid.x.f");
+        llvm::Value *x = builder_.CreateUIToFP(component_value, builder_.getFloatTy(), "gid.comp.f");
         llvm::Value *vec = llvm::UndefValue::get(lower_type(load.type));
         const int lanes = load.type == sema::TypeKind::Vec2 ? 2 : (load.type == sema::TypeKind::Vec3 ? 3 : 4);
         for (int i = 0; i < lanes; ++i) {
@@ -639,10 +700,12 @@ class HIREmitter {
     }
 
     llvm::Value *idx64 = builder_.CreateSExt(index, builder_.getInt64Ty());
-    llvm::Value *ptr = builder_.CreateGEP(builder_.getFloatTy(), state().data, idx64, "data.gep");
-    llvm::Value *loaded = builder_.CreateLoad(builder_.getFloatTy(), ptr, "data.load");
+    const sema::TypeKind elem_kind = normalize_buffer_element_kind(load.type);
+    llvm::Type *elem_type = buffer_element_type(elem_kind);
+    llvm::Value *ptr = builder_.CreateGEP(elem_type, buffer_base_ptr(load.buffer_name), idx64, "data.gep");
+    llvm::Value *loaded = builder_.CreateLoad(elem_type, ptr, "data.load");
 
-    return cast_value(loaded, sema::TypeKind::Float, load.type);
+    return cast_value(loaded, elem_kind, load.type);
   }
 
   llvm::Value *emit_buffer_store(const hir::BufferStore &store) {
@@ -653,15 +716,18 @@ class HIREmitter {
       index = builder_.getInt32(0);
     }
 
+    const sema::TypeKind elem_kind =
+        normalize_buffer_element_kind(store.value != nullptr ? store.value->type : sema::TypeKind::Float);
+    llvm::Type *elem_type = buffer_element_type(elem_kind);
+
     llvm::Value *value = store.value != nullptr ? emit_expr(*store.value) : nullptr;
-    value = cast_value(value, store.value != nullptr ? store.value->type : sema::TypeKind::Float,
-                       sema::TypeKind::Float);
+    value = cast_value(value, store.value != nullptr ? store.value->type : elem_kind, elem_kind);
     if (value == nullptr) {
-      value = llvm::ConstantFP::get(builder_.getFloatTy(), 0.0);
+      value = llvm::Constant::getNullValue(elem_type);
     }
 
     llvm::Value *idx64 = builder_.CreateSExt(index, builder_.getInt64Ty());
-    llvm::Value *ptr = builder_.CreateGEP(builder_.getFloatTy(), state().data, idx64, "data.gep");
+    llvm::Value *ptr = builder_.CreateGEP(elem_type, buffer_base_ptr(store.buffer_name), idx64, "data.gep");
     builder_.CreateStore(value, ptr);
     return nullptr;
   }

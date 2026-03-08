@@ -37,6 +37,12 @@ TypeKind TypeSystem::resolve_type_name(std::string_view name) const {
 }
 
 TypeKind TypeSystem::numeric_literal_type(std::string_view literal) const {
+  if (!literal.empty()) {
+    const char tail = literal.back();
+    if (tail == 'u' || tail == 'U') {
+      return TypeKind::Uint;
+    }
+  }
   return literal.find('.') == std::string_view::npos ? TypeKind::Int : TypeKind::Float;
 }
 
@@ -58,6 +64,20 @@ TypeKind TypeSystem::binary_result(std::string_view op, TypeKind lhs, TypeKind r
 
   if (op == "=") {
     return is_assignable(lhs, rhs) ? lhs : TypeKind::Error;
+  }
+
+  if (op == "==" || op == "<") {
+    if (lhs == rhs && is_scalar_type(lhs)) {
+      return TypeKind::Bool;
+    }
+    return TypeKind::Error;
+  }
+
+  if (op == "&") {
+    if (lhs == rhs && (lhs == TypeKind::Int || lhs == TypeKind::Uint || lhs == TypeKind::Bool)) {
+      return lhs;
+    }
+    return TypeKind::Error;
   }
 
   if (op == "+" || op == "-" || op == "*" || op == "/") {

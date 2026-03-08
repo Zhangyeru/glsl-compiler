@@ -51,6 +51,8 @@ const char *to_string(TokenKind kind) {
       return "KeywordVec4";
     case TokenKind::KeywordIf:
       return "KeywordIf";
+    case TokenKind::KeywordElse:
+      return "KeywordElse";
     case TokenKind::KeywordFor:
       return "KeywordFor";
     case TokenKind::KeywordReturn:
@@ -61,6 +63,8 @@ const char *to_string(TokenKind kind) {
       return "KeywordIn";
     case TokenKind::KeywordBuffer:
       return "KeywordBuffer";
+    case TokenKind::KeywordShared:
+      return "KeywordShared";
     case TokenKind::LBrace:
       return "LBrace";
     case TokenKind::RBrace:
@@ -83,8 +87,16 @@ const char *to_string(TokenKind kind) {
       return "Hash";
     case TokenKind::Equal:
       return "Equal";
+    case TokenKind::EqualEqual:
+      return "EqualEqual";
+    case TokenKind::Less:
+      return "Less";
+    case TokenKind::Ampersand:
+      return "Ampersand";
     case TokenKind::Plus:
       return "Plus";
+    case TokenKind::PlusPlus:
+      return "PlusPlus";
     case TokenKind::Minus:
       return "Minus";
     case TokenKind::Star:
@@ -168,9 +180,33 @@ Token Lexer::lex_token() {
       advance();
       return make_simple_token(TokenKind::Hash, location, ch);
     case '=':
+      if (lookahead(1) == '=') {
+        advance();
+        advance();
+        Token token;
+        token.kind = TokenKind::EqualEqual;
+        token.location = location;
+        token.lexeme = "==";
+        return token;
+      }
       advance();
       return make_simple_token(TokenKind::Equal, location, ch);
+    case '<':
+      advance();
+      return make_simple_token(TokenKind::Less, location, ch);
+    case '&':
+      advance();
+      return make_simple_token(TokenKind::Ampersand, location, ch);
     case '+':
+      if (lookahead(1) == '+') {
+        advance();
+        advance();
+        Token token;
+        token.kind = TokenKind::PlusPlus;
+        token.location = location;
+        token.lexeme = "++";
+        return token;
+      }
       advance();
       return make_simple_token(TokenKind::Plus, location, ch);
     case '-':
@@ -271,6 +307,10 @@ Token Lexer::lex_number() {
     }
   }
 
+  if (!at_end() && (current_char() == 'u' || current_char() == 'U')) {
+    advance();
+  }
+
   Token token;
   token.kind = TokenKind::NumericLiteral;
   token.location = location;
@@ -319,6 +359,9 @@ TokenKind Lexer::keyword_kind(std::string_view text) {
   if (text == "if") {
     return TokenKind::KeywordIf;
   }
+  if (text == "else") {
+    return TokenKind::KeywordElse;
+  }
   if (text == "for") {
     return TokenKind::KeywordFor;
   }
@@ -333,6 +376,9 @@ TokenKind Lexer::keyword_kind(std::string_view text) {
   }
   if (text == "buffer") {
     return TokenKind::KeywordBuffer;
+  }
+  if (text == "shared") {
+    return TokenKind::KeywordShared;
   }
   return TokenKind::Identifier;
 }

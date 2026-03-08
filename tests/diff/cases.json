@@ -61,18 +61,18 @@
       "shader": "shaders/diff_if_else.comp",
       "expect_glsl2llvm_success": false,
       "expect_glslang_success": true,
-      "expect_glsl2llvm_semantics": "syntax_error",
+      "expect_glsl2llvm_semantics": "undefined_symbol",
       "expect_glslang_semantics": "ok",
-      "expect_glsl2llvm_error_substr": ["parser error"]
+      "expect_glsl2llvm_error_substr": ["undefined variable"]
     },
     {
       "name": "diff.vec_ctor_swizzle",
       "shader": "shaders/diff_vec_constructor_and_swizzle.comp",
       "expect_glsl2llvm_success": false,
       "expect_glslang_success": false,
-      "expect_glsl2llvm_semantics": "undefined_symbol",
+      "expect_glsl2llvm_semantics": "unsupported_feature",
       "expect_glslang_semantics": "type_mismatch",
-      "expect_glsl2llvm_error_substr": ["undefined function: 'vec2'"],
+      "expect_glsl2llvm_error_substr": ["invalid member access '.xy'"],
       "expect_glslang_error_substr": ["cannot convert"]
     },
     {
@@ -87,20 +87,18 @@
     {
       "name": "diff.less_than_operator",
       "shader": "shaders/diff_less_than_operator.comp",
-      "expect_glsl2llvm_success": false,
+      "expect_glsl2llvm_success": true,
       "expect_glslang_success": true,
-      "expect_glsl2llvm_semantics": "syntax_error",
-      "expect_glslang_semantics": "ok",
-      "expect_glsl2llvm_error_substr": ["unexpected character near '<'"]
+      "expect_glsl2llvm_semantics": "ok",
+      "expect_glslang_semantics": "ok"
     },
     {
       "name": "diff.global_id_y",
       "shader": "shaders/diff_global_id_y.comp",
-      "expect_glsl2llvm_success": false,
+      "expect_glsl2llvm_success": true,
       "expect_glslang_success": true,
-      "expect_glsl2llvm_semantics": "unsupported_feature",
-      "expect_glslang_semantics": "ok",
-      "expect_glsl2llvm_error_substr": ["unsupported gl_GlobalInvocationID component: y"]
+      "expect_glsl2llvm_semantics": "ok",
+      "expect_glslang_semantics": "ok"
     }
   ]
 }

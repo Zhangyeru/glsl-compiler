@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Buf {
+  float data[];
+} buf;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  float v = buf.data[i];
+  for (int k = 0; k < 4; ++k) {
+    v = v * 1.1;
+  }
+  buf.data[i] = v;
+}

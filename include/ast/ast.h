@@ -115,6 +115,8 @@ struct VarDecl final : Stmt {
   std::unique_ptr<Expr> initializer;
   bool is_parameter = false;
   bool is_buffer_block = false;
+  bool is_shared = false;
+  bool is_array = false;
   std::string buffer_field_name;
   std::string buffer_element_type;
 };
@@ -127,13 +129,15 @@ struct BlockStmt final : Stmt {
 
 struct IfStmt final : Stmt {
   IfStmt(parser::SourceLocation node_location, std::unique_ptr<Expr> cond,
-         std::unique_ptr<Stmt> then_stmt)
+         std::unique_ptr<Stmt> then_stmt, std::unique_ptr<Stmt> else_stmt = nullptr)
       : Stmt(NodeKind::IfStmt, node_location),
         condition(std::move(cond)),
-        then_branch(std::move(then_stmt)) {}
+        then_branch(std::move(then_stmt)),
+        else_branch(std::move(else_stmt)) {}
 
   std::unique_ptr<Expr> condition;
   std::unique_ptr<Stmt> then_branch;
+  std::unique_ptr<Stmt> else_branch;
 };
 
 struct ForStmt final : Stmt {

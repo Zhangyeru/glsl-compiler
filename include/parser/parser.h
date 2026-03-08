@@ -48,8 +48,12 @@ class Parser {
 
   std::unique_ptr<ast::Expr> parse_expression();
   std::unique_ptr<ast::Expr> parse_assignment();
+  std::unique_ptr<ast::Expr> parse_equality();
+  std::unique_ptr<ast::Expr> parse_relational();
+  std::unique_ptr<ast::Expr> parse_bitwise_and();
   std::unique_ptr<ast::Expr> parse_additive();
   std::unique_ptr<ast::Expr> parse_multiplicative();
+  std::unique_ptr<ast::Expr> parse_unary();
   std::unique_ptr<ast::Expr> parse_postfix();
   std::unique_ptr<ast::Expr> parse_primary();
 

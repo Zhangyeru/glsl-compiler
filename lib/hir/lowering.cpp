@@ -152,6 +152,11 @@ std::unique_ptr<Stmt> ASTLowerer::lower_stmt(const ast::Stmt &stmt) {
 
       define_variable(decl.name, declared_type);
 
+      if (decl.is_array && declared_type == sema::TypeKind::BufferData) {
+        // Shared/local arrays are modeled as buffer-like indexed storage in this prototype.
+        return nullptr;
+      }
+
       auto lowered = std::make_unique<VarDecl>(decl.name, declared_type);
       if (decl.initializer != nullptr) {
         lowered->initializer = lower_expr(*decl.initializer);
@@ -176,6 +181,10 @@ std::unique_ptr<Stmt> ASTLowerer::lower_stmt(const ast::Stmt &stmt) {
         lowered->then_block = stmt_to_block(lower_stmt(*if_stmt.then_branch));
       } else {
         lowered->then_block = std::make_unique<Block>();
+      }
+
+      if (if_stmt.else_branch != nullptr) {
+        lowered->else_block = stmt_to_block(lower_stmt(*if_stmt.else_branch));
       }
 
       return lowered;
@@ -254,6 +263,14 @@ std::unique_ptr<Expr> ASTLowerer::lower_expr(const ast::Expr &expr) {
         return std::make_unique<BuiltinLoad>(literal.text, "", type);
       }
 
+      if (literal.text == "gl_LocalInvocationID") {
+        sema::TypeKind type = get_ast_type(literal);
+        if (type == sema::TypeKind::Unresolved) {
+          type = sema::TypeKind::Vec3;
+        }
+        return std::make_unique<BuiltinLoad>(literal.text, "", type);
+      }
+
       sema::TypeKind type = lookup_variable(literal.text);
       if (type == sema::TypeKind::Unresolved) {
         type = get_ast_type(literal);
@@ -275,7 +292,8 @@ std::unique_ptr<Expr> ASTLowerer::lower_expr(const ast::Expr &expr) {
 
       if (object != nullptr && object->kind == NodeKind::BuiltinLoad) {
         const auto *builtin = static_cast<const BuiltinLoad *>(object.get());
-        if (builtin->builtin_name == "gl_GlobalInvocationID") {
+        if (builtin->builtin_name == "gl_GlobalInvocationID" ||
+            builtin->builtin_name == "gl_LocalInvocationID") {
           return std::make_unique<BuiltinLoad>(builtin->builtin_name, member.member_name, result_type);
         }
       }
@@ -306,6 +324,14 @@ std::unique_ptr<Expr> ASTLowerer::lower_expr(const ast::Expr &expr) {
         auto load = std::unique_ptr<BufferLoad>(static_cast<BufferLoad *>(object.release()));
         load->index = cast_if_needed(std::move(idx), sema::TypeKind::Int);
         load->type = result_type;
+        return load;
+      }
+
+      if (object != nullptr && object->kind == NodeKind::Variable &&
+          object->type == sema::TypeKind::BufferData) {
+        const auto *var = static_cast<const Variable *>(object.get());
+        auto load = std::make_unique<BufferLoad>(var->name, "", result_type);
+        load->index = cast_if_needed(std::move(idx), sema::TypeKind::Int);
         return load;
       }
 
@@ -508,6 +534,9 @@ sema::TypeKind ASTLowerer::lookup_variable(const std::string &name) const {
   }
 
   if (name == "gl_GlobalInvocationID") {
+    return sema::TypeKind::Vec3;
+  }
+  if (name == "gl_LocalInvocationID") {
     return sema::TypeKind::Vec3;
   }
 

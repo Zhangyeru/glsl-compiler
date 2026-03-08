@@ -103,6 +103,14 @@ void dump_stmt(const Stmt *stmt, std::ostringstream &out, int depth) {
         out << "BufferBlock field='" << var->buffer_field_name << "' element='"
             << var->buffer_element_type << "'\n";
       }
+      if (var->is_shared) {
+        indent(out, depth + 1);
+        out << "Qualifier: shared\n";
+      }
+      if (var->is_array) {
+        indent(out, depth + 1);
+        out << "ArrayDecl: true\n";
+      }
       if (var->initializer != nullptr) {
         indent(out, depth + 1);
         out << "Initializer:\n";
@@ -129,6 +137,11 @@ void dump_stmt(const Stmt *stmt, std::ostringstream &out, int depth) {
       indent(out, depth + 1);
       out << "Then:\n";
       dump_stmt(if_stmt->then_branch.get(), out, depth + 2);
+      if (if_stmt->else_branch != nullptr) {
+        indent(out, depth + 1);
+        out << "Else:\n";
+        dump_stmt(if_stmt->else_branch.get(), out, depth + 2);
+      }
       return;
     }
     case NodeKind::ForStmt: {

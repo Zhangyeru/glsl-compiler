@@ -22,11 +22,15 @@ const T *as(const ast::Node *node) {
 SemaResult SemanticAnalyzer::analyze(ast::TranslationUnit &unit) {
   errors_.clear();
   symbols_ = SymbolTable();
+  buffer_fields_.clear();
+  shared_array_element_types_.clear();
 
   unit.resolved_type = TypeKind::Void;
 
-  // Builtin variable: simplified to vec3 for component access checks.
+  // Builtin variables: simplified to vec3 for component access checks.
   symbols_.define_variable("gl_GlobalInvocationID", TypeKind::Vec3, parser::SourceLocation{}, true);
+  symbols_.define_variable("gl_LocalInvocationID", TypeKind::Vec3, parser::SourceLocation{}, true);
+  symbols_.define_function("barrier", TypeKind::Void, {}, parser::SourceLocation{});
 
   // First pass: function signatures.
   for (auto &function_ptr : unit.functions) {
@@ -77,15 +81,69 @@ void SemanticAnalyzer::add_error(parser::SourceLocation location, std::string me
   errors_.push_back(SemaError{location, std::move(message)});
 }
 
+TypeKind SemanticAnalyzer::resolve_buffer_element_type(std::string_view name,
+                                                       parser::SourceLocation location) {
+  const TypeKind element_type = type_system_.resolve_type_name(name);
+  if (element_type == TypeKind::Float || element_type == TypeKind::Uint ||
+      element_type == TypeKind::Vec4) {
+    return element_type;
+  }
+
+  add_error(location, "unsupported buffer/shared element type '" + std::string(name) + "'");
+  return TypeKind::Error;
+}
+
+TypeKind SemanticAnalyzer::resolve_index_element_type(const ast::Expr *object_expr) const {
+  if (object_expr == nullptr) {
+    return TypeKind::Error;
+  }
+
+  if (const auto *member = as<ast::MemberExpr>(object_expr); member != nullptr) {
+    if (const auto *buffer_ref =
+            member->object != nullptr ? as<ast::LiteralExpr>(member->object.get()) : nullptr;
+        buffer_ref != nullptr &&
+        buffer_ref->value_kind == ast::LiteralExpr::ValueKind::Identifier) {
+      if (const auto field_it = buffer_fields_.find(buffer_ref->text); field_it != buffer_fields_.end()) {
+        if (member->member_name == field_it->second.field_name) {
+          return field_it->second.element_type;
+        }
+      }
+    }
+    return TypeKind::Float;
+  }
+
+  if (const auto *literal = as<ast::LiteralExpr>(object_expr);
+      literal != nullptr && literal->value_kind == ast::LiteralExpr::ValueKind::Identifier) {
+    if (const auto it = shared_array_element_types_.find(literal->text);
+        it != shared_array_element_types_.end()) {
+      return it->second;
+    }
+  }
+
+  return TypeKind::Float;
+}
+
 TypeKind SemanticAnalyzer::resolve_decl_type(ast::VarDecl &decl) {
   if (decl.is_buffer_block) {
-    if (decl.buffer_element_type != "float") {
-      add_error(decl.location, "only float buffer element type is supported");
+    const TypeKind element_type =
+        resolve_buffer_element_type(decl.buffer_element_type.empty() ? "float" : decl.buffer_element_type,
+                                    decl.location);
+    if (element_type == TypeKind::Error) {
       decl.resolved_type = TypeKind::Error;
       return TypeKind::Error;
     }
     decl.resolved_type = TypeKind::Buffer;
     return TypeKind::Buffer;
+  }
+
+  if (decl.is_array) {
+    const TypeKind element_type = resolve_buffer_element_type(decl.type_name, decl.location);
+    if (element_type == TypeKind::Error) {
+      decl.resolved_type = TypeKind::Error;
+      return TypeKind::Error;
+    }
+    decl.resolved_type = TypeKind::BufferData;
+    return TypeKind::BufferData;
   }
 
   TypeKind type = type_system_.resolve_type_name(decl.type_name);
@@ -109,6 +167,13 @@ void SemanticAnalyzer::analyze_global_var(ast::VarDecl &decl) {
 
   if (!symbols_.define_variable(decl.name, declared_type, decl.location)) {
     add_error(decl.location, "duplicate global variable definition: '" + decl.name + "'");
+  }
+
+  if (decl.is_buffer_block && declared_type == TypeKind::Buffer) {
+    buffer_fields_[decl.name] = BufferFieldInfo{
+        decl.buffer_field_name.empty() ? "data" : decl.buffer_field_name,
+        resolve_buffer_element_type(decl.buffer_element_type.empty() ? "float" : decl.buffer_element_type,
+                                    decl.location)};
   }
 
   if (decl.initializer != nullptr) {
@@ -173,6 +238,11 @@ void SemanticAnalyzer::analyze_stmt(ast::Stmt &stmt) {
         add_error(decl.location, "duplicate variable definition: '" + decl.name + "'");
       }
 
+      if (decl.is_array && declared_type == TypeKind::BufferData) {
+        shared_array_element_types_[decl.name] =
+            resolve_buffer_element_type(decl.type_name, decl.location);
+      }
+
       if (decl.initializer != nullptr) {
         const TypeKind init_type = analyze_expr(*decl.initializer);
         if (!type_system_.is_assignable(declared_type, init_type)) {
@@ -202,6 +272,9 @@ void SemanticAnalyzer::analyze_stmt(ast::Stmt &stmt) {
 
       if (if_stmt.then_branch != nullptr) {
         analyze_stmt(*if_stmt.then_branch);
+      }
+      if (if_stmt.else_branch != nullptr) {
+        analyze_stmt(*if_stmt.else_branch);
       }
       return;
     }
@@ -337,6 +410,35 @@ TypeKind SemanticAnalyzer::analyze_expr(ast::Expr &expr) {
         return call.resolved_type;
       }
 
+      const TypeKind ctor_type = type_system_.resolve_type_name(callee_identifier->text);
+      if (ctor_type != TypeKind::Unresolved && ctor_type != TypeKind::Void &&
+          ctor_type != TypeKind::Buffer && ctor_type != TypeKind::BufferData) {
+        if (ctor_type == TypeKind::Vec2 || ctor_type == TypeKind::Vec3 || ctor_type == TypeKind::Vec4) {
+          if (arg_types.empty()) {
+            add_error(call.location, "vector constructor requires at least one argument");
+          }
+          for (std::size_t i = 0; i < arg_types.size(); ++i) {
+            if (!type_system_.is_assignable(TypeKind::Float, arg_types[i])) {
+              add_error(call.location, "vector constructor argument " + std::to_string(i) +
+                                           " must be scalar numeric");
+            }
+          }
+        } else if (arg_types.size() != 1) {
+          add_error(call.location,
+                    "scalar constructor '" + callee_identifier->text + "' expects one argument");
+        } else if (!type_system_.is_assignable(ctor_type, arg_types[0])) {
+          add_error(call.location,
+                    "scalar constructor '" + callee_identifier->text +
+                        "' argument type mismatch");
+        }
+
+        if (call.callee != nullptr) {
+          call.callee->resolved_type = ctor_type;
+        }
+        call.resolved_type = ctor_type;
+        return call.resolved_type;
+      }
+
       const FunctionSymbol *function = symbols_.lookup_function(callee_identifier->text);
       if (function == nullptr) {
         add_error(call.location, "undefined function: '" + callee_identifier->text + "'");
@@ -380,10 +482,25 @@ TypeKind SemanticAnalyzer::analyze_expr(ast::Expr &expr) {
                                                               : nullptr;
           obj_literal != nullptr &&
           obj_literal->value_kind == ast::LiteralExpr::ValueKind::Identifier &&
-          obj_literal->text == "gl_GlobalInvocationID") {
+          (obj_literal->text == "gl_GlobalInvocationID" ||
+           obj_literal->text == "gl_LocalInvocationID")) {
         if (member.member_name == "x" || member.member_name == "y" || member.member_name == "z") {
           member.resolved_type = TypeKind::Uint;
           return member.resolved_type;
+        }
+      }
+
+      if (object_type == TypeKind::Buffer) {
+        if (const auto *obj_literal = member.object != nullptr ? as<ast::LiteralExpr>(member.object.get())
+                                                                : nullptr;
+            obj_literal != nullptr &&
+            obj_literal->value_kind == ast::LiteralExpr::ValueKind::Identifier) {
+          if (const auto field_it = buffer_fields_.find(obj_literal->text);
+              field_it != buffer_fields_.end() &&
+              member.member_name == field_it->second.field_name) {
+            member.resolved_type = TypeKind::BufferData;
+            return member.resolved_type;
+          }
         }
       }
 
@@ -413,8 +530,13 @@ TypeKind SemanticAnalyzer::analyze_expr(ast::Expr &expr) {
         add_error(index.location, "index expression must be int/uint");
       }
 
-      if (object_type == TypeKind::BufferData || object_type == TypeKind::Vec2 ||
-          object_type == TypeKind::Vec3 || object_type == TypeKind::Vec4) {
+      if (object_type == TypeKind::BufferData) {
+        index.resolved_type = resolve_index_element_type(index.object.get());
+        return index.resolved_type;
+      }
+
+      if (object_type == TypeKind::Vec2 || object_type == TypeKind::Vec3 ||
+          object_type == TypeKind::Vec4) {
         index.resolved_type = TypeKind::Float;
         return index.resolved_type;
       }

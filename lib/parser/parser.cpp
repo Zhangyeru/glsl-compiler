@@ -47,6 +47,16 @@ ParseResult Parser::parse_translation_unit() {
       continue;
     }
 
+    if (current_.kind == TokenKind::KeywordShared) {
+      advance();
+      auto shared_decl = parse_var_decl_stmt(true);
+      if (shared_decl != nullptr) {
+        shared_decl->is_shared = true;
+        unit->global_vars.push_back(std::move(shared_decl));
+      }
+      continue;
+    }
+
     if (!is_type_token(current_.kind)) {
       add_error(current_.location, "expected declaration at top level");
       advance();
@@ -292,6 +302,14 @@ std::unique_ptr<ast::Stmt> Parser::parse_statement() {
       return parse_for_stmt();
     case TokenKind::KeywordReturn:
       return parse_return_stmt();
+    case TokenKind::KeywordShared: {
+      advance();
+      auto decl = parse_var_decl_stmt(true);
+      if (decl != nullptr) {
+        decl->is_shared = true;
+      }
+      return decl;
+    }
     default:
       break;
   }
@@ -315,8 +333,17 @@ std::unique_ptr<ast::IfStmt> Parser::parse_if_stmt() {
   if (then_branch == nullptr) {
     then_branch = std::make_unique<ast::BlockStmt>(if_location);
   }
+  std::unique_ptr<ast::Stmt> else_branch = nullptr;
+  if (current_.kind == TokenKind::KeywordElse) {
+    advance();
+    else_branch = parse_statement();
+    if (else_branch == nullptr) {
+      else_branch = std::make_unique<ast::BlockStmt>(if_location);
+    }
+  }
 
-  return std::make_unique<ast::IfStmt>(if_location, std::move(condition), std::move(then_branch));
+  return std::make_unique<ast::IfStmt>(if_location, std::move(condition), std::move(then_branch),
+                                       std::move(else_branch));
 }
 
 std::unique_ptr<ast::ForStmt> Parser::parse_for_stmt() {
@@ -397,6 +424,15 @@ std::unique_ptr<ast::VarDecl> Parser::parse_var_decl_stmt(bool expect_semicolon)
   std::string name = current_.lexeme;
   advance();
 
+  bool is_array = false;
+  if (match(TokenKind::LBracket)) {
+    is_array = true;
+    if (current_.kind != TokenKind::RBracket) {
+      (void)parse_expression();
+    }
+    expect(TokenKind::RBracket, "expected ']' after array declarator");
+  }
+
   auto initializer = std::unique_ptr<ast::Expr>();
   if (match(TokenKind::Equal)) {
     initializer = parse_expression();
@@ -410,8 +446,10 @@ std::unique_ptr<ast::VarDecl> Parser::parse_var_decl_stmt(bool expect_semicolon)
     add_error(decl_location, "variable cannot have type void");
   }
 
-  return std::make_unique<ast::VarDecl>(decl_location, std::move(type_name), std::move(name),
-                                        std::move(initializer));
+  auto decl = std::make_unique<ast::VarDecl>(decl_location, std::move(type_name), std::move(name),
+                                             std::move(initializer));
+  decl->is_array = is_array;
+  return decl;
 }
 
 std::unique_ptr<ast::Expr> Parser::parse_expression() {
@@ -419,7 +457,7 @@ std::unique_ptr<ast::Expr> Parser::parse_expression() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parse_assignment() {
-  auto lhs = parse_additive();
+  auto lhs = parse_equality();
   if (lhs == nullptr) {
     return nullptr;
   }
@@ -440,6 +478,75 @@ std::unique_ptr<ast::Expr> Parser::parse_assignment() {
 
   return std::make_unique<ast::BinaryExpr>(op_location, std::move(op), std::move(lhs),
                                            std::move(rhs));
+}
+
+std::unique_ptr<ast::Expr> Parser::parse_equality() {
+  auto expr = parse_relational();
+  if (expr == nullptr) {
+    return nullptr;
+  }
+
+  while (current_.kind == TokenKind::EqualEqual) {
+    const SourceLocation op_location = current_.location;
+    const std::string op = current_.lexeme.empty() ? std::string("==") : current_.lexeme;
+    advance();
+
+    auto rhs = parse_relational();
+    if (rhs == nullptr) {
+      add_error(op_location, "expected right-hand side expression");
+      break;
+    }
+
+    expr = std::make_unique<ast::BinaryExpr>(op_location, op, std::move(expr), std::move(rhs));
+  }
+
+  return expr;
+}
+
+std::unique_ptr<ast::Expr> Parser::parse_relational() {
+  auto expr = parse_bitwise_and();
+  if (expr == nullptr) {
+    return nullptr;
+  }
+
+  while (current_.kind == TokenKind::Less) {
+    const SourceLocation op_location = current_.location;
+    const std::string op = current_.lexeme.empty() ? std::string("<") : current_.lexeme;
+    advance();
+
+    auto rhs = parse_bitwise_and();
+    if (rhs == nullptr) {
+      add_error(op_location, "expected right-hand side expression");
+      break;
+    }
+
+    expr = std::make_unique<ast::BinaryExpr>(op_location, op, std::move(expr), std::move(rhs));
+  }
+
+  return expr;
+}
+
+std::unique_ptr<ast::Expr> Parser::parse_bitwise_and() {
+  auto expr = parse_additive();
+  if (expr == nullptr) {
+    return nullptr;
+  }
+
+  while (current_.kind == TokenKind::Ampersand) {
+    const SourceLocation op_location = current_.location;
+    const std::string op = current_.lexeme.empty() ? std::string("&") : current_.lexeme;
+    advance();
+
+    auto rhs = parse_additive();
+    if (rhs == nullptr) {
+      add_error(op_location, "expected right-hand side expression");
+      break;
+    }
+
+    expr = std::make_unique<ast::BinaryExpr>(op_location, op, std::move(expr), std::move(rhs));
+  }
+
+  return expr;
 }
 
 std::unique_ptr<ast::Expr> Parser::parse_additive() {
@@ -468,7 +575,7 @@ std::unique_ptr<ast::Expr> Parser::parse_additive() {
 }
 
 std::unique_ptr<ast::Expr> Parser::parse_multiplicative() {
-  auto expr = parse_postfix();
+  auto expr = parse_unary();
   if (expr == nullptr) {
     return nullptr;
   }
@@ -480,7 +587,7 @@ std::unique_ptr<ast::Expr> Parser::parse_multiplicative() {
                                : current_.lexeme;
     advance();
 
-    auto rhs = parse_postfix();
+    auto rhs = parse_unary();
     if (rhs == nullptr) {
       add_error(op_location, "expected right-hand side expression");
       break;
@@ -490,6 +597,35 @@ std::unique_ptr<ast::Expr> Parser::parse_multiplicative() {
   }
 
   return expr;
+}
+
+std::unique_ptr<ast::Expr> Parser::parse_unary() {
+  if (current_.kind == TokenKind::PlusPlus) {
+    const SourceLocation op_location = current_.location;
+    advance();
+
+    if (current_.kind != TokenKind::Identifier) {
+      add_error(current_.location, "expected identifier after '++'");
+      return nullptr;
+    }
+
+    const SourceLocation id_location = current_.location;
+    const std::string name = current_.lexeme;
+    advance();
+
+    auto lhs_assign = std::make_unique<ast::LiteralExpr>(
+        id_location, ast::LiteralExpr::ValueKind::Identifier, name);
+    auto lhs_add = std::make_unique<ast::LiteralExpr>(
+        id_location, ast::LiteralExpr::ValueKind::Identifier, name);
+    auto one = std::make_unique<ast::LiteralExpr>(id_location, ast::LiteralExpr::ValueKind::Number,
+                                                  "1");
+    auto add = std::make_unique<ast::BinaryExpr>(op_location, "+", std::move(lhs_add),
+                                                 std::move(one));
+    return std::make_unique<ast::BinaryExpr>(op_location, "=", std::move(lhs_assign),
+                                             std::move(add));
+  }
+
+  return parse_postfix();
 }
 
 std::unique_ptr<ast::Expr> Parser::parse_postfix() {
