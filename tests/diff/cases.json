@@ -1,0 +1,106 @@
+{
+  "min_cases": 10,
+  "cases": [
+    {
+      "name": "ok.buffer_scale",
+      "shader": "shaders/ok_buffer_scale.comp",
+      "expect_glsl2llvm_success": true,
+      "expect_glslang_success": true,
+      "expect_glsl2llvm_semantics": "ok",
+      "expect_glslang_semantics": "ok"
+    },
+    {
+      "name": "ok.layout_xyz",
+      "shader": "shaders/ok_layout_xyz.comp",
+      "expect_glsl2llvm_success": true,
+      "expect_glslang_success": true,
+      "expect_glsl2llvm_semantics": "ok",
+      "expect_glslang_semantics": "ok"
+    },
+    {
+      "name": "match.undefined_symbol",
+      "shader": "shaders/fail_undefined_symbol.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": false,
+      "expect_glsl2llvm_semantics": "undefined_symbol",
+      "expect_glslang_semantics": "undefined_symbol",
+      "expect_glsl2llvm_error_substr": ["undefined variable"],
+      "expect_glslang_error_substr": ["undeclared identifier"]
+    },
+    {
+      "name": "match.duplicate_definition",
+      "shader": "shaders/fail_duplicate_definition.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": false,
+      "expect_glsl2llvm_semantics": "duplicate_definition",
+      "expect_glslang_semantics": "duplicate_definition",
+      "expect_glsl2llvm_error_substr": ["duplicate variable definition"],
+      "expect_glslang_error_substr": ["redefinition"]
+    },
+    {
+      "name": "match.type_mismatch",
+      "shader": "shaders/fail_type_mismatch.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": false,
+      "expect_glsl2llvm_semantics": "type_mismatch",
+      "expect_glslang_semantics": "type_mismatch",
+      "expect_glsl2llvm_error_substr": ["type mismatch"],
+      "expect_glslang_error_substr": ["cannot convert"]
+    },
+    {
+      "name": "diff.while_loop",
+      "shader": "shaders/diff_while_loop.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": true,
+      "expect_glsl2llvm_semantics": "syntax_error",
+      "expect_glslang_semantics": "ok",
+      "expect_glsl2llvm_error_substr": ["parser error"]
+    },
+    {
+      "name": "diff.if_else",
+      "shader": "shaders/diff_if_else.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": true,
+      "expect_glsl2llvm_semantics": "syntax_error",
+      "expect_glslang_semantics": "ok",
+      "expect_glsl2llvm_error_substr": ["parser error"]
+    },
+    {
+      "name": "diff.vec_ctor_swizzle",
+      "shader": "shaders/diff_vec_constructor_and_swizzle.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": false,
+      "expect_glsl2llvm_semantics": "undefined_symbol",
+      "expect_glslang_semantics": "type_mismatch",
+      "expect_glsl2llvm_error_substr": ["undefined function: 'vec2'"],
+      "expect_glslang_error_substr": ["cannot convert"]
+    },
+    {
+      "name": "diff.multi_buffer_field",
+      "shader": "shaders/diff_multi_buffer_field.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": true,
+      "expect_glsl2llvm_semantics": "unsupported_feature",
+      "expect_glslang_semantics": "ok",
+      "expect_glsl2llvm_error_substr": ["invalid member access '.extra'"]
+    },
+    {
+      "name": "diff.less_than_operator",
+      "shader": "shaders/diff_less_than_operator.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": true,
+      "expect_glsl2llvm_semantics": "syntax_error",
+      "expect_glslang_semantics": "ok",
+      "expect_glsl2llvm_error_substr": ["unexpected character near '<'"]
+    },
+    {
+      "name": "diff.global_id_y",
+      "shader": "shaders/diff_global_id_y.comp",
+      "expect_glsl2llvm_success": false,
+      "expect_glslang_success": true,
+      "expect_glsl2llvm_semantics": "unsupported_feature",
+      "expect_glslang_semantics": "ok",
+      "expect_glsl2llvm_error_substr": ["unsupported gl_GlobalInvocationID component: y"]
+    }
+  ]
+}

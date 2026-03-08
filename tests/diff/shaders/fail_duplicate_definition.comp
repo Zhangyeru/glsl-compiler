@@ -1,0 +1,7 @@
+#version 450
+layout(local_size_x = 64) in;
+
+void main() {
+  float a = 1.0;
+  float a = 2.0;
+}

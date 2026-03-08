@@ -1,0 +1,7 @@
+#version 450
+layout(local_size_x = 64) in;
+
+void main() {
+  vec2 a = vec2(1.0, 2.0);
+  float b = a.xy;
+}
