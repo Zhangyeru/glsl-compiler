@@ -1,0 +1,1138 @@
+diff --git a/framework/include/tilefwk/platform.h b/framework/include/tilefwk/platform.h
+index 3afc8af5..14f42ebe 100644
+--- a/framework/include/tilefwk/platform.h
++++ b/framework/include/tilefwk/platform.h
+@@ -317,6 +317,7 @@ enum class NPUArch{
+     DAV_1001 = 1001,
+     DAV_2201 = 2201,
+     DAV_3510 = 3510,
++    GPU_VK = 9001,
+     DAV_UNKNOWN
+ };
+ 
+@@ -325,6 +326,7 @@ inline std::string NPUArchToString(NPUArch npu_arch) {
+         case NPUArch::DAV_1001: return "DAV_1001";
+         case NPUArch::DAV_2201: return "DAV_2201";
+         case NPUArch::DAV_3510: return "DAV_3510";
++        case NPUArch::GPU_VK: return "GPU_VK";
+         default: return "UNKNOWN_NPU_ARCH";
+     }
+ }
+@@ -494,4 +496,4 @@ public:
+         return ss.str();
+     }
+ };
+-} // namespace npu::tile_fwk
+\ No newline at end of file
++} // namespace npu::tile_fwk
+diff --git a/framework/src/codegen/codegen_factory.h b/framework/src/codegen/codegen_factory.h
+index 7bf7793e..75645895 100644
+--- a/framework/src/codegen/codegen_factory.h
++++ b/framework/src/codegen/codegen_factory.h
+@@ -26,6 +26,7 @@
+ #include "interface/program/program.h"
+ #include "interface/configs/config_manager.h"
+ #include "cloudnpu/codegen_cloudnpu.h"
++#include "gpu_vk/codegen_gpu_vk.h"
+ 
+ namespace npu::tile_fwk {
+ class CodeGenFactory {
+@@ -35,7 +36,11 @@ public:
+         if (platform == NPUArch::DAV_2201 || platform == NPUArch::DAV_3510) {
+             return std::make_shared<CodeGenCloudNPU>(ctx);
+         }
+-        ASSERT(false) << "can not support this platform: " << ToUnderlying(platform) << ", please check environment";
++        if (platform == NPUArch::GPU_VK) {
++            return std::make_shared<CodeGenGpuVk>(ctx);
++        }
++        ASSERT(false) << "can not support this platform/backend: " << ToUnderlying(platform)
++                      << ", expected one of DAV_2201, DAV_3510, GPU_VK";
+         return nullptr;
+     }
+ };
+diff --git a/framework/src/codegen/gpu_vk/codegen_gpu_vk.cpp b/framework/src/codegen/gpu_vk/codegen_gpu_vk.cpp
+new file mode 100644
+index 00000000..6befdf2a
+--- /dev/null
++++ b/framework/src/codegen/gpu_vk/codegen_gpu_vk.cpp
+@@ -0,0 +1,776 @@
++/**
++ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file codegen_gpu_vk.cpp
++ * \brief Vulkan GLSL/SPIR-V backend for framework codegen.
++ */
++
++#include "codegen_gpu_vk.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdlib>
++#include <fstream>
++#include <optional>
++#include <sstream>
++#include <unordered_map>
++#include <unordered_set>
++#include <utility>
++#include <vector>
++
++#include <unistd.h>
++
++#include "codegen/utils/parallel_execute.h"
++#include "interface/configs/config_manager.h"
++#include "interface/function/function.h"
++#include "interface/operation/operation.h"
++#include "interface/tensor/logical_tensor.h"
++#include "interface/utils/file_utils.h"
++#include "tilefwk/element.h"
++#include "tilefwk/tilefwk_op.h"
++
++namespace npu::tile_fwk {
++namespace {
++constexpr uint32_t DEFAULT_LOCAL_SIZE_X = 256;
++const std::string GPU_VK_OUTPUT_DIR = "kernel_gpu_vk";
++const std::string SPIRV_EXT = ".spv";
++const std::string SHADER_EXT = ".comp";
++const std::string PUSH_CONST_NAME = "pc";
++const std::string GLOBAL_INDEX_NAME = "gid";
++
++bool ContainsUnsafeShellChar(const std::string &cmdStr) {
++    static const std::unordered_set<char> forbidden{';', '|', '`', '>', '<', '\'', '"', '\n', '\r'};
++    return std::any_of(cmdStr.begin(), cmdStr.end(), [](char c) { return forbidden.count(c) > 0; });
++}
++
++std::string SanitizeIdentifier(const std::string &value) {
++    std::string result;
++    result.reserve(value.size());
++    for (char c : value) {
++        if (std::isalnum(static_cast<unsigned char>(c)) != 0) {
++            result.push_back(c);
++        } else {
++            result.push_back('_');
++        }
++    }
++    if (result.empty() || std::isdigit(static_cast<unsigned char>(result.front())) != 0) {
++        result.insert(result.begin(), '_');
++    }
++    return result;
++}
++
++std::string MakeKernelName(const Function &topFunc, uint64_t programId) {
++    std::ostringstream kernelName;
++    kernelName << topFunc.GetMagicName() << "_" << programId << "_gpu_vk";
++    return SanitizeIdentifier(kernelName.str());
++}
++
++std::string Basename(const std::string &path) {
++    size_t pos = path.find_last_of('/');
++    if (pos == std::string::npos) {
++        return path;
++    }
++    return path.substr(pos + 1);
++}
++
++uint64_t ComputeStaticNumel(const std::shared_ptr<LogicalTensor> &tensor) {
++    if (tensor == nullptr || tensor->GetShape().empty()) {
++        return 1;
++    }
++    uint64_t numel = 1;
++    for (int64_t dim : tensor->GetShape()) {
++        if (dim <= 0) {
++            return 1;
++        }
++        numel *= static_cast<uint64_t>(dim);
++    }
++    return numel;
++}
++
++bool IsSupportedStorageType(DataType dataType) {
++    switch (dataType) {
++        case DT_FP32:
++        case DT_INT32:
++        case DT_UINT32:
++        case DT_BOOL:
++            return true;
++        default:
++            return false;
++    }
++}
++
++std::string GetGlslValueType(DataType dataType) {
++    switch (dataType) {
++        case DT_FP32:
++            return "float";
++        case DT_INT32:
++            return "int";
++        case DT_UINT32:
++            return "uint";
++        case DT_BOOL:
++            return "bool";
++        default:
++            ASSERT(false) << "gpu_vk backend does not support dtype " << DataType2String(dataType);
++            return "";
++    }
++}
++
++std::string GetGlslBufferType(DataType dataType) {
++    return dataType == DT_BOOL ? "uint" : GetGlslValueType(dataType);
++}
++
++std::string GetZeroLiteral(DataType dataType) {
++    switch (dataType) {
++        case DT_FP32:
++            return "0.0";
++        case DT_INT32:
++            return "0";
++        case DT_UINT32:
++        case DT_BOOL:
++            return "0u";
++        default:
++            ASSERT(false) << "gpu_vk backend does not support dtype " << DataType2String(dataType);
++            return "";
++    }
++}
++
++std::string GetScalarLiteral(const Element &value, DataType dataType) {
++    std::ostringstream oss;
++    switch (dataType) {
++        case DT_FP32:
++            oss << value.Cast<float>();
++            if (oss.str().find('.') == std::string::npos && oss.str().find('e') == std::string::npos &&
++                oss.str().find('E') == std::string::npos) {
++                oss << ".0";
++            }
++            return oss.str();
++        case DT_INT32:
++            return std::to_string(value.Cast<int32_t>());
++        case DT_UINT32:
++            return std::to_string(value.Cast<uint32_t>()) + "u";
++        case DT_BOOL:
++            return value.Cast<bool>() ? "true" : "false";
++        default:
++            ASSERT(false) << "gpu_vk backend does not support scalar dtype " << DataType2String(dataType);
++            return "";
++    }
++}
++
++std::string CastExpr(DataType dstType, const std::string &expr, DataType srcType) {
++    if (dstType == srcType) {
++        return expr;
++    }
++    if (dstType == DT_BOOL) {
++        return "((" + expr + ") != " + GetZeroLiteral(srcType) + ")";
++    }
++    if (srcType == DT_BOOL) {
++        return GetGlslValueType(dstType) + "((" + expr + ") ? 1 : 0)";
++    }
++    return GetGlslValueType(dstType) + "(" + expr + ")";
++}
++
++std::string ToConditionExpr(const std::string &expr, DataType dataType) {
++    if (dataType == DT_BOOL) {
++        return expr;
++    }
++    return "((" + expr + ") != " + GetZeroLiteral(dataType) + ")";
++}
++
++std::string ResolveExecutableFromPath(const std::string &binary) {
++    const char *pathEnv = std::getenv("PATH");
++    if (pathEnv == nullptr) {
++        return "";
++    }
++
++    std::stringstream ss(pathEnv);
++    std::string dir;
++    while (std::getline(ss, dir, ':')) {
++        if (dir.empty()) {
++            continue;
++        }
++        std::string candidate = dir + "/" + binary;
++        if (access(candidate.c_str(), X_OK) == 0) {
++            return candidate;
++        }
++    }
++    return "";
++}
++
++std::string DetectShaderCompilerBinary() {
++    for (const char *binary : {"glslangValidator", "glslc"}) {
++        std::string resolved = ResolveExecutableFromPath(binary);
++        if (!resolved.empty()) {
++            return resolved;
++        }
++    }
++    return "";
++}
++
++struct BindingInfo {
++    int binding{-1};
++    int rawMagic{-1};
++    DataType dataType{DT_BOTTOM};
++    std::string name;
++};
++
++class GpuVkShaderBuilder {
++public:
++    GpuVkShaderBuilder(Function &topFunc, Function &subFunc, std::string kernelName)
++        : topFunc_(topFunc), subFunc_(subFunc), kernelName_(std::move(kernelName)) {
++        InitBindings();
++        const auto &outcasts = subFunc_.GetOutcast().empty() ? subFunc_.GetOriginOutcast() : subFunc_.GetOutcast();
++        const auto &incasts = subFunc_.GetIncast().empty() ? subFunc_.GetOriginIncast() : subFunc_.GetIncast();
++        if (!outcasts.empty()) {
++            staticNumel_ = ComputeStaticNumel(outcasts.front());
++        } else if (!incasts.empty()) {
++            staticNumel_ = ComputeStaticNumel(incasts.front());
++        }
++    }
++
++    std::string Build() {
++        std::ostringstream oss;
++        EmitHeader(oss);
++        EmitMain(oss);
++        return oss.str();
++    }
++
++private:
++    void InitBindings() {
++        int nextBinding = 0;
++        auto registerTensor = [this, &nextBinding](const std::shared_ptr<LogicalTensor> &tensor) {
++            ASSERT(tensor != nullptr) << "interface tensor can not be null";
++            ASSERT(IsSupportedStorageType(tensor->Datatype()))
++                << "gpu_vk backend does not support interface tensor dtype "
++                << DataType2String(tensor->Datatype()) << " for tensor " << tensor->Dump();
++
++            const int rawMagic = tensor->GetRawMagic();
++            if (rawMagicToBinding_.count(rawMagic) == 0) {
++                BindingInfo binding;
++                binding.binding = nextBinding++;
++                binding.rawMagic = rawMagic;
++                binding.dataType = tensor->Datatype();
++                std::string rawSymbol = tensor->GetRawTensor() == nullptr ? "" : tensor->GetRawTensor()->GetSymbol();
++                if (rawSymbol.empty()) {
++                    rawSymbol = "tensor";
++                }
++                binding.name = "buf_" + SanitizeIdentifier(rawSymbol) + "_" + std::to_string(rawMagic);
++                rawMagicToBinding_[rawMagic] = binding;
++                bindingOrder_.push_back(rawMagic);
++            } else {
++                ASSERT(rawMagicToBinding_.at(rawMagic).dataType == tensor->Datatype())
++                    << "same raw tensor mapped to different dtypes in gpu_vk backend";
++            }
++            tensorMagicToRawMagic_[tensor->GetMagic()] = rawMagic;
++        };
++
++        const auto &incasts = subFunc_.GetIncast().empty() ? subFunc_.GetOriginIncast() : subFunc_.GetIncast();
++        const auto &outcasts = subFunc_.GetOutcast().empty() ? subFunc_.GetOriginOutcast() : subFunc_.GetOutcast();
++        for (const auto &tensor : incasts) {
++            registerTensor(tensor);
++        }
++        for (const auto &tensor : outcasts) {
++            registerTensor(tensor);
++        }
++    }
++
++    void EmitHeader(std::ostringstream &oss) const {
++        oss << "#version 450\n\n";
++        oss << "// kernel: " << kernelName_ << "\n";
++        oss << "// static_numel: " << staticNumel_ << "\n";
++        oss << "layout(local_size_x = " << DEFAULT_LOCAL_SIZE_X << ", local_size_y = 1, local_size_z = 1) in;\n\n";
++        for (int rawMagic : bindingOrder_) {
++            const auto &binding = rawMagicToBinding_.at(rawMagic);
++            oss << "layout(set = 0, binding = " << binding.binding << ", std430) buffer Buffer_" << binding.binding
++                << " {\n"
++                << "    " << GetGlslBufferType(binding.dataType) << " data[];\n"
++                << "} " << binding.name << ";\n\n";
++        }
++        oss << "layout(push_constant) uniform PushConstants {\n"
++            << "    uint numel;\n"
++            << "} " << PUSH_CONST_NAME << ";\n\n";
++    }
++
++    void EmitMain(std::ostringstream &oss) {
++        std::ostringstream localDecls;
++        std::ostringstream body;
++        OperationsViewer operations = subFunc_.Operations(false);
++        for (const auto &op : operations) {
++            EmitOperation(op, localDecls, body);
++        }
++
++        oss << "void main() {\n";
++        oss << "    uint " << GLOBAL_INDEX_NAME << " = gl_GlobalInvocationID.x;\n";
++        oss << "    if (" << GLOBAL_INDEX_NAME << " >= " << PUSH_CONST_NAME << ".numel) {\n";
++        oss << "        return;\n";
++        oss << "    }\n";
++        if (!localDecls.str().empty()) {
++            oss << "\n" << localDecls.str();
++        }
++        if (!body.str().empty()) {
++            oss << "\n" << body.str();
++        }
++        oss << "}\n";
++    }
++
++    std::string MakeLocalName(const std::shared_ptr<LogicalTensor> &tensor) const {
++        return "local_" + std::to_string(tensor->GetMagic());
++    }
++
++    std::string EnsureLocalName(
++        const std::shared_ptr<LogicalTensor> &tensor, std::ostringstream &localDecls, bool declareOnly = false) {
++        ASSERT(tensor != nullptr) << "local tensor can not be null";
++        ASSERT(IsSupportedStorageType(tensor->Datatype()))
++            << "gpu_vk backend does not support local tensor dtype "
++            << DataType2String(tensor->Datatype()) << " for tensor " << tensor->Dump();
++        const int magic = tensor->GetMagic();
++        if (localTensorNames_.count(magic) == 0) {
++            std::string localName = MakeLocalName(tensor);
++            localTensorNames_[magic] = localName;
++            localDecls << "    " << GetGlslValueType(tensor->Datatype()) << " " << localName << ";\n";
++        }
++        (void)declareOnly;
++        return localTensorNames_.at(magic);
++    }
++
++    bool IsInterfaceTensor(const std::shared_ptr<LogicalTensor> &tensor) const {
++        return tensor != nullptr && tensorMagicToRawMagic_.count(tensor->GetMagic()) > 0;
++    }
++
++    std::string ReadTensor(const std::shared_ptr<LogicalTensor> &tensor, std::ostringstream &localDecls) {
++        ASSERT(tensor != nullptr) << "input tensor can not be null";
++        if (IsInterfaceTensor(tensor)) {
++            const auto &binding = rawMagicToBinding_.at(tensorMagicToRawMagic_.at(tensor->GetMagic()));
++            std::string accessExpr = binding.name + ".data[" + GLOBAL_INDEX_NAME + "]";
++            if (tensor->Datatype() == DT_BOOL) {
++                return "(" + accessExpr + " != 0u)";
++            }
++            return accessExpr;
++        }
++        return EnsureLocalName(tensor, localDecls);
++    }
++
++    void WriteTensor(const std::shared_ptr<LogicalTensor> &tensor, const std::string &expr, DataType exprType,
++        std::ostringstream &localDecls, std::ostringstream &body) {
++        ASSERT(tensor != nullptr) << "output tensor can not be null";
++        if (IsInterfaceTensor(tensor)) {
++            const auto &binding = rawMagicToBinding_.at(tensorMagicToRawMagic_.at(tensor->GetMagic()));
++            std::string storeExpr;
++            if (tensor->Datatype() == DT_BOOL) {
++                std::string condExpr = exprType == DT_BOOL ? expr : ToConditionExpr(expr, exprType);
++                storeExpr = "(" + condExpr + " ? 1u : 0u)";
++            } else {
++                storeExpr = CastExpr(tensor->Datatype(), expr, exprType);
++            }
++            body << "    " << binding.name << ".data[" << GLOBAL_INDEX_NAME << "] = " << storeExpr << ";\n";
++            return;
++        }
++
++        std::string localName = EnsureLocalName(tensor, localDecls);
++        body << "    " << localName << " = " << CastExpr(tensor->Datatype(), expr, exprType) << ";\n";
++    }
++
++    static bool IsIdentityLikeOp(Opcode opcode) {
++        static const std::unordered_set<Opcode> ops{
++            Opcode::OP_RESHAPE,
++            Opcode::OP_RESHAPE_COPY_IN,
++            Opcode::OP_RESHAPE_COPY_OUT,
++            Opcode::OP_VIEW,
++            Opcode::OP_ASSEMBLE,
++            Opcode::OP_ASSEMBLE_SSA,
++            Opcode::OP_DUPLICATE,
++            Opcode::OP_COPY_IN,
++            Opcode::OP_COPY_OUT,
++            Opcode::OP_LOAD,
++            Opcode::OP_NOP,
++        };
++        return ops.count(opcode) > 0;
++    }
++
++    std::string EmitUnaryExpr(const Operation &op, const std::string &srcExpr, DataType srcType,
++        const DataType dstType) const {
++        switch (op.GetOpcode()) {
++            case Opcode::OP_NEG:
++                return "(-(" + srcExpr + "))";
++            case Opcode::OP_ABS:
++                return "abs(" + srcExpr + ")";
++            case Opcode::OP_EXP:
++                return "exp(" + srcExpr + ")";
++            case Opcode::OP_EXP2:
++                return "exp2(" + srcExpr + ")";
++            case Opcode::OP_EXPM1:
++                return "(exp(" + srcExpr + ") - 1.0)";
++            case Opcode::OP_LOG1P:
++                return "log(1.0 + " + srcExpr + ")";
++            case Opcode::OP_LN:
++                return "log(" + srcExpr + ")";
++            case Opcode::OP_SQRT:
++                return "sqrt(" + srcExpr + ")";
++            case Opcode::OP_RSQRT:
++                return "(1.0 / sqrt(" + srcExpr + "))";
++            case Opcode::OP_RECIPROCAL:
++                return "(1.0 / (" + srcExpr + "))";
++            case Opcode::OP_RELU:
++                return "max(" + srcExpr + ", " + GetZeroLiteral(srcType) + ")";
++            case Opcode::OP_FLOOR:
++                return "floor(" + srcExpr + ")";
++            case Opcode::OP_CEIL:
++                return "ceil(" + srcExpr + ")";
++            case Opcode::OP_TRUNC:
++                return "trunc(" + srcExpr + ")";
++            case Opcode::OP_ROUND:
++                return "round(" + srcExpr + ")";
++            case Opcode::OP_LOGICALNOT:
++                return "(!" + ToConditionExpr(srcExpr, srcType) + ")";
++            case Opcode::OP_SIGN:
++                return "sign(" + srcExpr + ")";
++            case Opcode::OP_SIGNBIT:
++                return "(" + srcExpr + " < " + GetZeroLiteral(srcType) + ")";
++            case Opcode::OP_ISFINITE:
++                return "(!(isnan(" + srcExpr + ") || isinf(" + srcExpr + ")))";
++            case Opcode::OP_CAST:
++                return CastExpr(dstType, srcExpr, srcType);
++            default:
++                ASSERT(false) << "unsupported unary opcode for gpu_vk: " << op.GetOpcodeStr();
++                return "";
++        }
++    }
++
++    std::string EmitBinaryExpr(Opcode opcode, const std::string &lhsExpr, DataType lhsType, const std::string &rhsExpr,
++        DataType rhsType) const {
++        switch (opcode) {
++            case Opcode::OP_ADD:
++            case Opcode::OP_ADD_BRC:
++                return "(" + lhsExpr + " + " + rhsExpr + ")";
++            case Opcode::OP_SUB:
++            case Opcode::OP_SUB_BRC:
++                return "(" + lhsExpr + " - " + rhsExpr + ")";
++            case Opcode::OP_MUL:
++            case Opcode::OP_MUL_BRC:
++                return "(" + lhsExpr + " * " + rhsExpr + ")";
++            case Opcode::OP_DIV:
++            case Opcode::OP_DIV_BRC:
++                return "(" + lhsExpr + " / " + rhsExpr + ")";
++            case Opcode::OP_MAXIMUM:
++            case Opcode::OP_MAX_BRC:
++                return "max(" + lhsExpr + ", " + rhsExpr + ")";
++            case Opcode::OP_MINIMUM:
++            case Opcode::OP_MIN_BRC:
++                return "min(" + lhsExpr + ", " + rhsExpr + ")";
++            case Opcode::OP_HYPOT:
++                return "sqrt((" + lhsExpr + " * " + lhsExpr + ") + (" + rhsExpr + " * " + rhsExpr + "))";
++            case Opcode::OP_LOGICALAND:
++                return "(" + ToConditionExpr(lhsExpr, lhsType) + " && " + ToConditionExpr(rhsExpr, rhsType) + ")";
++            case Opcode::OP_BITWISEAND:
++                return "(" + lhsExpr + " & " + rhsExpr + ")";
++            case Opcode::OP_BITWISEOR:
++                return "(" + lhsExpr + " | " + rhsExpr + ")";
++            case Opcode::OP_BITWISEXOR:
++                return "(" + lhsExpr + " ^ " + rhsExpr + ")";
++            default:
++                ASSERT(false) << "unsupported binary opcode for gpu_vk: " << OpcodeManager::Inst().GetOpcodeStr(opcode);
++                return "";
++        }
++    }
++
++    std::string EmitVectorScalarExpr(const Operation &op, const std::string &srcExpr, DataType srcType) const {
++        ASSERT(op.HasAttribute(OpAttributeKey::scalar)) << "vector-scalar op requires scalar attribute";
++        std::string scalarExpr = GetScalarLiteral(op.GetElementAttribute(OpAttributeKey::scalar), srcType);
++        switch (op.GetOpcode()) {
++            case Opcode::OP_ADDS:
++                return "(" + srcExpr + " + " + scalarExpr + ")";
++            case Opcode::OP_SUBS:
++                return "(" + srcExpr + " - " + scalarExpr + ")";
++            case Opcode::OP_MULS:
++                return "(" + srcExpr + " * " + scalarExpr + ")";
++            case Opcode::OP_DIVS:
++                return "(" + srcExpr + " / " + scalarExpr + ")";
++            case Opcode::OP_MAXS:
++                return "max(" + srcExpr + ", " + scalarExpr + ")";
++            case Opcode::OP_MINS:
++                return "min(" + srcExpr + ", " + scalarExpr + ")";
++            default:
++                ASSERT(false) << "unsupported vector-scalar opcode for gpu_vk: " << op.GetOpcodeStr();
++                return "";
++        }
++    }
++
++    std::string EmitCompareExpr(const Operation &op, std::ostringstream &localDecls) {
++        int64_t cmpMode = op.GetIntAttribute(OP_ATTR_PREFIX + "cmp_mode");
++        ASSERT(cmpMode == static_cast<int64_t>(OutType::BOOL))
++            << "gpu_vk backend only supports BOOL compare output, mode=" << cmpMode;
++
++        int64_t cmpOperation = op.GetIntAttribute(OP_ATTR_PREFIX + "cmp_operation");
++        std::string lhsExpr = ReadTensor(op.GetInputOperand(0), localDecls);
++        DataType lhsType = op.GetInputOperand(0)->Datatype();
++
++        std::string rhsExpr;
++        if (op.GetOpcode() == Opcode::OP_CMPS) {
++            rhsExpr = GetScalarLiteral(op.GetElementAttribute(OpAttributeKey::scalar), lhsType);
++        } else {
++            rhsExpr = ReadTensor(op.GetInputOperand(1), localDecls);
++        }
++
++        std::string comparator;
++        switch (static_cast<OpType>(cmpOperation)) {
++            case OpType::EQ:
++                comparator = "==";
++                break;
++            case OpType::NE:
++                comparator = "!=";
++                break;
++            case OpType::LT:
++                comparator = "<";
++                break;
++            case OpType::LE:
++                comparator = "<=";
++                break;
++            case OpType::GT:
++                comparator = ">";
++                break;
++            case OpType::GE:
++                comparator = ">=";
++                break;
++            default:
++                ASSERT(false) << "unsupported compare operation for gpu_vk: " << cmpOperation;
++                break;
++        }
++        return "(" + lhsExpr + " " + comparator + " " + rhsExpr + ")";
++    }
++
++    std::string EmitWhereExpr(const Operation &op, std::ostringstream &localDecls) {
++        std::string condExpr = ReadTensor(op.GetInputOperand(0), localDecls);
++        DataType condType = op.GetInputOperand(0)->Datatype();
++        std::string predExpr = ToConditionExpr(condExpr, condType);
++
++        std::string lhsExpr;
++        DataType lhsType = op.GetOutputOperand(0)->Datatype();
++        std::string rhsExpr;
++
++        switch (op.GetOpcode()) {
++            case Opcode::OP_WHERE_SS: {
++                ASSERT(op.HasAttribute(OpAttributeKey::vectorScalar)) << "WHERE_SS requires vectorScalar attribute";
++                auto scalars = op.GetVectorElementAttribute(OpAttributeKey::vectorScalar);
++                ASSERT(scalars.size() == 2) << "WHERE_SS expects exactly 2 scalar operands";
++                lhsExpr = GetScalarLiteral(scalars[0], lhsType);
++                rhsExpr = GetScalarLiteral(scalars[1], lhsType);
++                break;
++            }
++            case Opcode::OP_WHERE_ST: {
++                ASSERT(op.HasAttribute(OpAttributeKey::scalar)) << "WHERE_ST requires scalar attribute";
++                lhsExpr = GetScalarLiteral(op.GetElementAttribute(OpAttributeKey::scalar), lhsType);
++                rhsExpr = ReadTensor(op.GetInputOperand(1), localDecls);
++                break;
++            }
++            case Opcode::OP_WHERE_TS: {
++                lhsExpr = ReadTensor(op.GetInputOperand(1), localDecls);
++                ASSERT(op.HasAttribute(OpAttributeKey::scalar)) << "WHERE_TS requires scalar attribute";
++                rhsExpr = GetScalarLiteral(op.GetElementAttribute(OpAttributeKey::scalar), lhsType);
++                break;
++            }
++            case Opcode::OP_WHERE_TT: {
++                lhsExpr = ReadTensor(op.GetInputOperand(1), localDecls);
++                rhsExpr = ReadTensor(op.GetInputOperand(2), localDecls);
++                break;
++            }
++            default:
++                ASSERT(false) << "unsupported where opcode for gpu_vk: " << op.GetOpcodeStr();
++                break;
++        }
++        return "(" + predExpr + " ? " + lhsExpr + " : " + rhsExpr + ")";
++    }
++
++    void EmitOperation(const Operation &op, std::ostringstream &localDecls, std::ostringstream &body) {
++        for (const auto &comment : op.GetCommentList()) {
++            body << "    // " << comment << "\n";
++        }
++
++        Opcode opcode = op.GetOpcode();
++        if (opcode == Opcode::OP_UNKNOWN) {
++            ASSERT(false) << "gpu_vk backend does not support unknown opcode";
++        }
++
++        if (IsIdentityLikeOp(opcode)) {
++            if (op.GetOutputOperandSize() == 0 || op.GetInputOperandSize() == 0) {
++                return;
++            }
++            std::string expr = ReadTensor(op.GetInputOperand(0), localDecls);
++            WriteTensor(op.GetOutputOperand(0), expr, op.GetInputOperand(0)->Datatype(), localDecls, body);
++            return;
++        }
++
++        if (opcode == Opcode::OP_WHERE_SS || opcode == Opcode::OP_WHERE_ST || opcode == Opcode::OP_WHERE_TS ||
++            opcode == Opcode::OP_WHERE_TT) {
++            WriteTensor(op.GetOutputOperand(0), EmitWhereExpr(op, localDecls), op.GetOutputOperand(0)->Datatype(),
++                localDecls, body);
++            return;
++        }
++
++        if (opcode == Opcode::OP_CMP || opcode == Opcode::OP_CMPS) {
++            WriteTensor(op.GetOutputOperand(0), EmitCompareExpr(op, localDecls), DT_BOOL, localDecls, body);
++            return;
++        }
++
++        if (opcode == Opcode::OP_ADD || opcode == Opcode::OP_SUB || opcode == Opcode::OP_MUL || opcode == Opcode::OP_DIV ||
++            opcode == Opcode::OP_ADD_BRC || opcode == Opcode::OP_SUB_BRC || opcode == Opcode::OP_MUL_BRC ||
++            opcode == Opcode::OP_DIV_BRC || opcode == Opcode::OP_MAXIMUM || opcode == Opcode::OP_MINIMUM ||
++            opcode == Opcode::OP_MAX_BRC || opcode == Opcode::OP_MIN_BRC || opcode == Opcode::OP_HYPOT ||
++            opcode == Opcode::OP_LOGICALAND || opcode == Opcode::OP_BITWISEAND || opcode == Opcode::OP_BITWISEOR ||
++            opcode == Opcode::OP_BITWISEXOR) {
++            auto lhs = op.GetInputOperand(0);
++            auto rhs = op.GetInputOperand(1);
++            std::string lhsExpr = ReadTensor(lhs, localDecls);
++            std::string rhsExpr = ReadTensor(rhs, localDecls);
++            std::string expr = EmitBinaryExpr(opcode, lhsExpr, lhs->Datatype(), rhsExpr, rhs->Datatype());
++            WriteTensor(op.GetOutputOperand(0), expr, op.GetOutputOperand(0)->Datatype(), localDecls, body);
++            return;
++        }
++
++        if (opcode == Opcode::OP_ADDS || opcode == Opcode::OP_SUBS || opcode == Opcode::OP_MULS ||
++            opcode == Opcode::OP_DIVS || opcode == Opcode::OP_MAXS || opcode == Opcode::OP_MINS) {
++            auto input = op.GetInputOperand(0);
++            std::string srcExpr = ReadTensor(input, localDecls);
++            std::string expr = EmitVectorScalarExpr(op, srcExpr, input->Datatype());
++            WriteTensor(op.GetOutputOperand(0), expr, op.GetOutputOperand(0)->Datatype(), localDecls, body);
++            return;
++        }
++
++        if (opcode == Opcode::OP_NEG || opcode == Opcode::OP_ABS || opcode == Opcode::OP_EXP || opcode == Opcode::OP_EXP2 ||
++            opcode == Opcode::OP_EXPM1 || opcode == Opcode::OP_LOG1P || opcode == Opcode::OP_LN ||
++            opcode == Opcode::OP_SQRT || opcode == Opcode::OP_RSQRT || opcode == Opcode::OP_RECIPROCAL ||
++            opcode == Opcode::OP_RELU || opcode == Opcode::OP_FLOOR || opcode == Opcode::OP_CEIL ||
++            opcode == Opcode::OP_TRUNC || opcode == Opcode::OP_ROUND || opcode == Opcode::OP_LOGICALNOT ||
++            opcode == Opcode::OP_SIGN || opcode == Opcode::OP_SIGNBIT || opcode == Opcode::OP_ISFINITE ||
++            opcode == Opcode::OP_CAST) {
++            auto input = op.GetInputOperand(0);
++            std::string srcExpr = ReadTensor(input, localDecls);
++            std::string expr = EmitUnaryExpr(op, srcExpr, input->Datatype(), op.GetOutputOperand(0)->Datatype());
++            WriteTensor(op.GetOutputOperand(0), expr, op.GetOutputOperand(0)->Datatype(), localDecls, body);
++            return;
++        }
++
++        ASSERT(false) << "gpu_vk backend does not support opcode " << op.GetOpcodeStr()
++                      << " in function " << topFunc_.GetMagicName();
++    }
++
++private:
++    Function &topFunc_;
++    Function &subFunc_;
++    std::string kernelName_;
++    uint64_t staticNumel_{1};
++    std::unordered_map<int, BindingInfo> rawMagicToBinding_;
++    std::unordered_map<int, int> tensorMagicToRawMagic_;
++    std::vector<int> bindingOrder_;
++    std::unordered_map<int, std::string> localTensorNames_;
++};
++
++} // namespace
++
++VkCompileInfo::VkCompileInfo(
++    Function &topFunc, const CodeGenCtx &ctx, const std::pair<uint64_t, Function *> &subFuncPair) {
++    kernelName_ = MakeKernelName(topFunc, subFuncPair.first);
++    std::string stem = kernelName_ + "_" + topFunc.GetFunctionHash().Data();
++    shaderAbsPath_ = ctx.cceDir + "/" + stem + SHADER_EXT;
++    binAbsPath_ = ctx.cceDir + "/" + stem + SPIRV_EXT;
++    funcDeclare_ = "void " + kernelName_ + "();";
++}
++
++CodeGenGpuVk::CodeGenGpuVk(const CodeGenCtx &cgCtx) : CodeGenCCE(cgCtx) {
++    if (cgCtx.IsCCEPathEmpty()) {
++        ctx.cceDir = config::LogTopFolder() + "/" + GPU_VK_OUTPUT_DIR;
++        CreateMultiLevelDir(ctx.cceDir);
++    }
++}
++
++std::string CodeGenGpuVk::DetectShaderCompiler() {
++    return DetectShaderCompilerBinary();
++}
++
++std::string CodeGenGpuVk::GenShaderSource(
++    Function &topFunc, Function &subFunc, const VkCompileInfo &compileInfo) const {
++    GpuVkShaderBuilder shaderBuilder(topFunc, subFunc, compileInfo.GetKernelName());
++    return shaderBuilder.Build();
++}
++
++void CodeGenGpuVk::DumpShader(const std::string &fileName, const std::string &shaderSource) const {
++    bool dumped = DumpFile(shaderSource, fileName);
++    ASSERT(dumped) << "failed to dump gpu_vk shader file: " << fileName;
++}
++
++std::optional<std::pair<int, std::string>> CodeGenGpuVk::CompileShader(const VkCompileInfo &compileInfo) const {
++    if (config::GetHostOption<int64_t>(COMPILE_STAGE) == CS_CODEGEN_INSTRUCTION) {
++        CODEGEN_LOGI("Compile stage terminates after gpu_vk shader codegen.");
++        return std::nullopt;
++    }
++
++    std::string compiler = DetectShaderCompilerBinary();
++    if (compiler.empty()) {
++        CODEGEN_LOGW("No shader compiler found for gpu_vk backend, skip SPIR-V compile for %s",
++            compileInfo.GetShaderAbsPath().c_str());
++        return std::nullopt;
++    }
++
++    std::ostringstream oss;
++    if (Basename(compiler) == "glslangValidator") {
++        oss << compiler << " -V -S comp -o " << compileInfo.GetBinAbsPath() << " " << compileInfo.GetShaderAbsPath();
++    } else {
++        oss << compiler << " -fshader-stage=compute -o " << compileInfo.GetBinAbsPath() << " "
++            << compileInfo.GetShaderAbsPath();
++    }
++    std::string cmd = oss.str();
++    ASSERT(!ContainsUnsafeShellChar(cmd)) << "unsafe shader compile command: " << cmd;
++    int ret = std::system(cmd.c_str());
++    ASSERT(ret == 0) << "gpu_vk shader compile failed. cmd: " << cmd;
++    return std::make_pair(ret, cmd);
++}
++
++void CodeGenGpuVk::UpdateSubFunc(std::pair<uint64_t, Function *> subFuncPair, const VkCompileInfo &compileInfo) const {
++    auto leafFunc = subFuncPair.second;
++    std::shared_ptr<LeafFuncAttribute> attr = leafFunc->GetLeafFuncAttribute();
++    if (attr == nullptr) {
++        attr = std::make_shared<LeafFuncAttribute>();
++    }
++
++    if (ctx.isMainBlock) {
++        attr->kernelNameMainBlock = compileInfo.GetKernelName();
++        attr->binPathMainBlock = compileInfo.GetBinAbsPath();
++        attr->kernelDeclareMainBlock = compileInfo.GetFuncDeclare();
++    } else {
++        attr->kernelName = compileInfo.GetKernelName();
++        attr->binPath = compileInfo.GetBinAbsPath();
++        attr->kernelDeclare = compileInfo.GetFuncDeclare();
++    }
++    attr->coreType = CoreType::AIV;
++    leafFunc->SetLeafFuncAttribute(attr);
++}
++
++void CodeGenGpuVk::GenCode(
++    Function &topFunc, [[maybe_unused]] const std::map<uint64_t, std::list<InvokeParaOffset>> &invokeParaOffset) {
++    std::deque<std::function<void(void)>> tasks;
++    for (auto &subFuncPair : topFunc.rootFunc_->programs_) {
++        std::function<void(void)> task = [this, subFuncPair, &topFunc]() {
++            auto *subFunc = subFuncPair.second;
++            ASSERT(subFunc != nullptr) << "gpu_vk codegen requires non-null leaf function";
++            ASSERT(!subFunc->IsAicpuSubFunction().first) << "gpu_vk backend does not support AICPU sub-functions";
++
++            VkCompileInfo compileInfo(topFunc, ctx, subFuncPair);
++            std::string shaderSource = GenShaderSource(topFunc, *subFunc, compileInfo);
++            DumpShader(compileInfo.GetShaderAbsPath(), shaderSource);
++            (void)CompileShader(compileInfo);
++            UpdateSubFunc(subFuncPair, compileInfo);
++        };
++        tasks.push_back(task);
++    }
++
++    unsigned threadNum = ConfigManager::Instance().GetCodeGenConfig(KEY_PARALLEL_COMPILE, 1u);
++    ParallelExecuteAndWait(threadNum, tasks);
++}
++
++} // namespace npu::tile_fwk
+diff --git a/framework/src/codegen/gpu_vk/codegen_gpu_vk.h b/framework/src/codegen/gpu_vk/codegen_gpu_vk.h
+new file mode 100644
+index 00000000..d3a94356
+--- /dev/null
++++ b/framework/src/codegen/gpu_vk/codegen_gpu_vk.h
+@@ -0,0 +1,62 @@
++/**
++ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file codegen_gpu_vk.h
++ * \brief Vulkan GLSL/SPIR-V backend for framework codegen.
++ */
++
++#ifndef CODEGEN_GPU_VK_H
++#define CODEGEN_GPU_VK_H
++
++#include <optional>
++#include <string>
++#include <utility>
++
++#include "codegen/codegen_cce.h"
++
++namespace npu::tile_fwk {
++class Function;
++
++class VkCompileInfo {
++public:
++    VkCompileInfo(Function &topFunc, const CodeGenCtx &ctx, const std::pair<uint64_t, Function *> &subFuncPair);
++
++    const std::string &GetKernelName() const { return kernelName_; }
++    const std::string &GetShaderAbsPath() const { return shaderAbsPath_; }
++    const std::string &GetBinAbsPath() const { return binAbsPath_; }
++    const std::string &GetFuncDeclare() const { return funcDeclare_; }
++
++private:
++    std::string kernelName_;
++    std::string shaderAbsPath_;
++    std::string binAbsPath_;
++    std::string funcDeclare_;
++};
++
++class CodeGenGpuVk : public CodeGenCCE {
++public:
++    explicit CodeGenGpuVk(const CodeGenCtx &cgCtx);
++    ~CodeGenGpuVk() override = default;
++
++    void GenCode(Function &topFunc, const std::map<uint64_t, std::list<InvokeParaOffset>> &invokeParaOffset) override;
++
++    static std::string DetectShaderCompiler();
++
++private:
++    std::string GenShaderSource(Function &topFunc, Function &subFunc, const VkCompileInfo &compileInfo) const;
++    void DumpShader(const std::string &fileName, const std::string &shaderSource) const;
++    std::optional<std::pair<int, std::string>> CompileShader(const VkCompileInfo &compileInfo) const;
++    void UpdateSubFunc(std::pair<uint64_t, Function *> subFuncPair, const VkCompileInfo &compileInfo) const;
++};
++
++} // namespace npu::tile_fwk
++
++#endif // CODEGEN_GPU_VK_H
+diff --git a/framework/src/platform/platform.cpp b/framework/src/platform/platform.cpp
+index 4b417fd8..b50a95f3 100644
+--- a/framework/src/platform/platform.cpp
++++ b/framework/src/platform/platform.cpp
+@@ -38,6 +38,8 @@ const std::unordered_map<std::string, NPUArch> npuArchMap = {
+     {"1001", NPUArch::DAV_1001},
+     {"2201", NPUArch::DAV_2201},
+     {"3510", NPUArch::DAV_3510},
++    {"gpu_vk", NPUArch::GPU_VK},
++    {"GPU_VK", NPUArch::GPU_VK},
+ };
+ 
+ NPUArch StringToNPUArch(const std::string& npuArch) {
+diff --git a/framework/tests/ut/CMakeLists.txt b/framework/tests/ut/CMakeLists.txt
+index 1058ef8f..fc4605e6 100644
+--- a/framework/tests/ut/CMakeLists.txt
++++ b/framework/tests/ut/CMakeLists.txt
+@@ -15,13 +15,13 @@ if (ENABLE_UTEST)
+     PTO_Fwk_UTest_AddModuleDir(DIR operator)
+     PTO_Fwk_UTest_AddModuleDir(DIR interface)
+     PTO_Fwk_UTest_AddModuleDir(DIR passes)
++    PTO_Fwk_UTest_AddModuleDir(DIR codegen)
+     if (NOT ENABLE_ASAN)
+         PTO_Fwk_UTest_AddModuleDir(DIR simulation)
+     endif ()
+ 
+     if (BUILD_WITH_CANN)
+         PTO_Fwk_UTest_AddModuleDir(DIR machine)
+-        PTO_Fwk_UTest_AddModuleDir(DIR codegen)
+     endif ()
+ 
+     # 可执行程序
+diff --git a/framework/tests/ut/codegen/include/test_codegen_utils.h b/framework/tests/ut/codegen/include/test_codegen_utils.h
+index e7724eec..0d90ca57 100644
+--- a/framework/tests/ut/codegen/include/test_codegen_utils.h
++++ b/framework/tests/ut/codegen/include/test_codegen_utils.h
+@@ -61,6 +61,9 @@ struct LogicalTensorInfo {
+ std::shared_ptr<LogicalTensor> CreateLogicalTensor(const LogicalTensorInfo &info);
+ 
+ std::string GetResultFromCpp(const Function &function);
++std::string GetShaderPathFromFunction(const Function &function);
++std::string GetSpirvPathFromFunction(const Function &function);
++std::string GetResultFromShader(const Function &function);
+ 
+ void CheckStringExist(const std::string &expect, const std::string &result);
+ 
+@@ -68,4 +71,4 @@ Function *GenMockFuncDyn(const std::string &funcName, const std::vector<int64_t>
+ 
+ } // namespace npu::tile_fwk
+ 
+-#endif // TEST_CODEGEN_UTILS_H
+\ No newline at end of file
++#endif // TEST_CODEGEN_UTILS_H
+diff --git a/framework/tests/ut/codegen/src/test_gpu_vk/test_codegen_gpu_vk.cpp b/framework/tests/ut/codegen/src/test_gpu_vk/test_codegen_gpu_vk.cpp
+new file mode 100644
+index 00000000..ec0c8b3a
+--- /dev/null
++++ b/framework/tests/ut/codegen/src/test_gpu_vk/test_codegen_gpu_vk.cpp
+@@ -0,0 +1,124 @@
++/**
++ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
++ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
++ * CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file test_codegen_gpu_vk.cpp
++ * \brief Unit test for gpu_vk codegen backend.
++ */
++
++#include <gtest/gtest.h>
++
++#include "codegen/codegen.h"
++#include "codegen/gpu_vk/codegen_gpu_vk.h"
++#include "interface/configs/config_manager.h"
++#include "interface/utils/file_utils.h"
++#include "tilefwk/platform.h"
++#include "tilefwk/tilefwk.h"
++#include "test_codegen_utils.h"
++
++namespace npu::tile_fwk {
++class TestCodegenGpuVk : public ::testing::Test {
++public:
++    void SetUp() override {
++        Program::GetInstance().Reset();
++        config::Reset();
++        config::SetBuildStatic(true);
++        config::SetHostOption(COMPILE_STAGE, CS_EXECUTE_GRAPH);
++        config::SetPlatformConfig(KEY_ENABLE_COST_MODEL, false);
++        oldArch_ = Platform::Instance().GetSoc().GetNPUArch();
++        Platform::Instance().GetSoc().SetNPUArch(NPUArch::GPU_VK);
++    }
++
++    void TearDown() override {
++        Platform::Instance().GetSoc().SetNPUArch(oldArch_);
++    }
++
++private:
++    NPUArch oldArch_{NPUArch::DAV_2201};
++};
++
++TEST_F(TestCodegenGpuVk, TestFactoryDispatchAddShaderGeneration) {
++    std::vector<int64_t> shape = {64, 64};
++    Tensor inputA(DT_FP32, shape, "A");
++    Tensor inputB(DT_FP32, shape, "B");
++    Tensor output(DT_FP32, shape, "C");
++
++    FUNCTION("GPU_VK_ADD", {inputA, inputB, output}) {
++        output = Add(inputA, inputB);
++    }
++
++    auto function = Program::GetInstance().GetFunctionByRawName(FUNCTION_PREFIX + std::string("GPU_VK_ADD"));
++    ASSERT_NE(function, nullptr);
++
++    CodeGen codegen(CodeGenCtx{});
++    codegen.GenCode(*function, {});
++
++    std::string shader = GetResultFromShader(*function);
++    CheckStringExist("#version 450", shader);
++    CheckStringExist("layout(local_size_x = 256", shader);
++    CheckStringExist("layout(push_constant) uniform PushConstants", shader);
++    CheckStringExist("buf_A_", shader);
++    CheckStringExist("buf_B_", shader);
++    CheckStringExist("buf_C_", shader);
++    CheckStringExist("gl_GlobalInvocationID.x", shader);
++    CheckStringExist("pc.numel", shader);
++    CheckStringExist(" + ", shader);
++}
++
++TEST_F(TestCodegenGpuVk, TestWhereShaderGeneration) {
++    std::vector<int64_t> shape = {32, 32};
++    Tensor condition(DT_BOOL, shape, "Cond");
++    Tensor inputA(DT_FP32, shape, "A");
++    Tensor inputB(DT_FP32, shape, "B");
++    Tensor output(DT_FP32, shape, "Out");
++
++    FUNCTION("GPU_VK_WHERE", {condition, inputA, inputB, output}) {
++        output = Where(condition, inputA, inputB);
++    }
++
++    auto function = Program::GetInstance().GetFunctionByRawName(FUNCTION_PREFIX + std::string("GPU_VK_WHERE"));
++    ASSERT_NE(function, nullptr);
++
++    CodeGen codegen(CodeGenCtx{});
++    codegen.GenCode(*function, {});
++
++    std::string shader = GetResultFromShader(*function);
++    CheckStringExist("buf_Cond_", shader);
++    CheckStringExist(" != 0u", shader);
++    CheckStringExist(" ? ", shader);
++    CheckStringExist(" : ", shader);
++}
++
++TEST_F(TestCodegenGpuVk, TestSpirvCompileWhenCompilerAvailable) {
++    if (CodeGenGpuVk::DetectShaderCompiler().empty()) {
++        GTEST_SKIP() << "glslangValidator/glslc is not available in PATH";
++    }
++
++    std::vector<int64_t> shape = {16, 16};
++    Tensor inputA(DT_FP32, shape, "A");
++    Tensor inputB(DT_FP32, shape, "B");
++    Tensor output(DT_FP32, shape, "C");
++
++    FUNCTION("GPU_VK_COMPILE", {inputA, inputB, output}) {
++        output = Mul(inputA, inputB);
++    }
++
++    auto function = Program::GetInstance().GetFunctionByRawName(FUNCTION_PREFIX + std::string("GPU_VK_COMPILE"));
++    ASSERT_NE(function, nullptr);
++
++    CodeGen codegen(CodeGenCtx{});
++    codegen.GenCode(*function, {});
++
++    std::string spirvPath = GetSpirvPathFromFunction(*function);
++    EXPECT_FALSE(RealPath(spirvPath).empty()) << "Expected SPIR-V binary at " << spirvPath;
++    EXPECT_GT(GetFileSize(spirvPath), 0u);
++}
++
++} // namespace npu::tile_fwk
+diff --git a/framework/tests/ut/codegen/src/utils/test_codegen_utils.cpp b/framework/tests/ut/codegen/src/utils/test_codegen_utils.cpp
+index d97f8b9e..d90b6f3f 100644
+--- a/framework/tests/ut/codegen/src/utils/test_codegen_utils.cpp
++++ b/framework/tests/ut/codegen/src/utils/test_codegen_utils.cpp
+@@ -64,6 +64,30 @@ std::string GetResultFromCpp(const Function &function) {
+     return res;
+ }
+ 
++std::string GetShaderPathFromFunction(const Function &function) {
++    const auto &subFunc = function.rootFunc_->programs_[0];
++    auto leafFuncAttr = subFunc->GetLeafFuncAttribute();
++    ASSERT(leafFuncAttr != nullptr);
++    std::string binPath = leafFuncAttr->binPath;
++    ASSERT(!binPath.empty());
++    return binPath.substr(0, binPath.rfind('.')) + ".comp";
++}
++
++std::string GetSpirvPathFromFunction(const Function &function) {
++    const auto &subFunc = function.rootFunc_->programs_[0];
++    auto leafFuncAttr = subFunc->GetLeafFuncAttribute();
++    ASSERT(leafFuncAttr != nullptr);
++    return leafFuncAttr->binPath;
++}
++
++std::string GetResultFromShader(const Function &function) {
++    std::string shaderFile = GetShaderPathFromFunction(function);
++    std::ifstream ifs(shaderFile);
++    std::string res((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
++    ifs.close();
++    return res;
++}
++
+ void CheckStringExist(const std::string &target, const std::string &content) {
+     bool res = content.find(target) != std::string::npos;
+     EXPECT_TRUE(res) << "target: \n" << target << "\n\n ---- not found in content ---- \n\n" << content << std::endl;
+diff --git a/framework/tests/ut/interface/src/platform/test_platform.cpp b/framework/tests/ut/interface/src/platform/test_platform.cpp
+index 6174493c..945addbe 100644
+--- a/framework/tests/ut/interface/src/platform/test_platform.cpp
++++ b/framework/tests/ut/interface/src/platform/test_platform.cpp
+@@ -174,4 +174,11 @@ TEST_F(TestPlatform, A5Stub) {
+     Platform::Instance().GetDie().FindNearestPath(MemoryType::MEM_UB, MemoryType::MEM_L1, path); 
+     EXPECT_EQ(path.size(), Num2); 
+     path.clear();
+-}
+\ No newline at end of file
++}
++
++TEST_F(TestPlatform, TestGpuVkArchMapping) {
++    Platform::Instance().GetSoc().SetNPUArch("gpu_vk");
++    EXPECT_EQ(Platform::Instance().GetSoc().GetNPUArch(), NPUArch::GPU_VK);
++    EXPECT_EQ(NPUArchToString(NPUArch::GPU_VK), "GPU_VK");
++    Platform::Instance().GetSoc().SetNPUArch(NPUArch::DAV_2201);
++}
